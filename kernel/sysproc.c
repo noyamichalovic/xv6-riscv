@@ -89,3 +89,21 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+// Return the size of the calling process's memory in bytes.
+uint64
+sys_memsize(void)
+{
+  return myproc()->sz;
+}
+
+// Coroutine-style yield to another process, passing an integer value.
+// Returns the value passed back by the target, or -1 on error.
+uint64
+sys_co_yield(void)
+{
+  int pid, value;
+  argint(0, &pid);
+  argint(1, &value);
+  return coyield(pid, value);
+}

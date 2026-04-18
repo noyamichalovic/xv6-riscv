@@ -462,9 +462,18 @@ scheduler(void)
         c->proc = p;
         swtch(&c->context, &p->context);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
+        // A process returned to the scheduler via sched().
+        // Normally ran == p, but co_yield's direct switching can change
+        // mycpu()->proc mid-timeslice: if process B (= p) directly switched
+        // to process A, mycpu()->proc becomes A.  When A later calls sched(),
+        // the scheduler resumes here with c->proc == A and p == B.
+        // We must release the lock of whoever actually ran (they held it when
+        // calling sched()).  If ran != p, p->lock was already released during
+        // the direct switch — releasing it again would panic.
+        struct proc *ran = c->proc;
         c->proc = 0;
+        release(&ran->lock);
+        continue;  // skip outer release(&p->lock): already handled above
       }
       release(&p->lock);
     }
@@ -649,6 +658,130 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
   } else {
     memmove(dst, (char*)src, len);
     return 0;
+  }
+}
+
+// Coroutine-style cooperative yield: transfer execution directly from the
+// calling process to the target process (identified by PID), passing an
+// integer value.  The target receives that value as the return value of its
+// own co_yield call, creating a bidirectional channel between two cooperating
+// processes.
+//
+// Only correct when both processes run on the same CPU (set CPUS=1).
+//
+// Sleep-channel convention:
+//   A process sleeping inside co_yield while targeting PID X stores
+//   chan = (void*)(uint64)X.  Raw PID integers are never used as wakeup
+//   channels elsewhere in xv6, so these channels never produce false wakeups.
+//   A process sleeping on such a channel must only be woken via co_yield;
+//   the standard scheduler ignores it (SLEEPING processes are never scheduled).
+//
+// Direct-switch lock protocol (switching from calling process P to target Q):
+//   Both locks are acquired in memory-address order to prevent deadlock.
+//   Before swtch(&P->context, &Q->context):
+//     - Release P->lock so that whoever switches back to P can acquire it.
+//     - Keep Q->lock so that Q resumes from inside sched() with exactly one
+//       lock held, satisfying sched()'s noff==1 invariant.
+//   When P is later resumed, its lock is held by convention (the process that
+//   switched to P kept P->lock and released its own), so P releases it and
+//   returns normally.
+int
+coyield(int target_pid, int value)
+{
+  struct proc *p = myproc();
+
+  // Validate: pid must be positive and cannot be the calling process itself.
+  if (target_pid <= 0 || target_pid == p->pid)
+    return -1;
+
+  // Find the target process by PID (no lock needed for a simple scan).
+  struct proc *target = 0;
+  for (struct proc *tp = proc; tp < &proc[NPROC]; tp++) {
+    if (tp->pid == target_pid) {
+      target = tp;
+      break;
+    }
+  }
+  if (target == 0)
+    return -1;
+
+  // Acquire both locks in address order to prevent deadlock.
+  struct proc *first  = (p < target) ? p : target;
+  struct proc *second = (p < target) ? target : p;
+  acquire(&first->lock);
+  acquire(&second->lock);
+
+  // Re-validate under lock: the slot may have been recycled between the
+  // scan above and now (pid reused, or process freed → UNUSED).
+  if (target->pid != target_pid || target->killed ||
+      target->state == UNUSED || target->state == ZOMBIE) {
+    release(&second->lock);
+    release(&first->lock);
+    return -1;
+  }
+
+  if (target->state == SLEEPING &&
+      target->chan == (void*)(uint64)p->pid) {
+    // ── Case 1: target is already sleeping, waiting for us ───────────────
+    //
+    // Write the value into the target's trapframe a1 register.
+    // a1 is not touched by the syscall return path (syscall() only writes a0),
+    // so the value survives until the target reads it after waking up.
+    target->trapframe->a1 = (uint64)value;
+
+    // Promote target directly to RUNNING, bypassing RUNNABLE / scheduler.
+    target->state = RUNNING;
+
+    // Put ourselves to sleep, recording who we are waiting for.
+    p->chan  = (void*)(uint64)target_pid;
+    p->state = SLEEPING;
+    mycpu()->proc = target;
+
+    // Save per-CPU interrupt-enable state (mirrors what sched() does) so
+    // it is correctly restored at the resume point below.
+    int intena = mycpu()->intena;
+
+    // Release OUR lock before swtch.
+    //   After this, exactly one lock (target->lock) is held: noff == 1.
+    //   The process that later switches back to us will keep our lock across
+    //   its own swtch call, handing it back to us at the resume point.
+    release(&p->lock);
+
+    // Direct context switch — scheduler is bypassed entirely.
+    swtch(&p->context, &target->context);
+
+    // ── Resume point: another process switched directly to us ─────────────
+    //   Our lock is held (noff == 1) by convention; restore intena first.
+    mycpu()->intena = intena;
+    p->chan = 0;
+
+    // Retrieve the value deposited by whoever woke us up (stored in a1).
+    int ret = (int)p->trapframe->a1;
+    release(&p->lock);
+    return ret;
+
+  } else {
+    // ── Case 2: target is not yet ready; sleep and wait for it ───────────
+    //
+    // When target calls co_yield(our_pid, val) it will find us sleeping here
+    // (state == SLEEPING, chan == our_pid) and take Case 1, switching to us.
+    p->chan  = (void*)(uint64)target_pid;
+    p->state = SLEEPING;
+
+    // Release target's lock.  After this exactly one lock (p->lock) is held,
+    // satisfying sched()'s noff == 1 requirement.
+    release(&target->lock);
+
+    // Hand off to the scheduler.  Returns when target does a direct switch.
+    sched();
+
+    // ── Resume point: target took Case 1 and switched directly to us ──────
+    //   p->lock is held (target kept it across its swtch); intena was already
+    //   restored by sched() itself.
+    p->chan = 0;
+    int ret = (int)p->trapframe->a1;   // deposited by target before the switch (in a1)
+    release(&p->lock);
+    return ret;
   }
 }
 
